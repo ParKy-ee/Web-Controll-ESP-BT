@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"name": "BL_Connnect",
+			"path": "../../../Documents/PlatformIO/Projects/BL_Connnect"
+		},
+		{
+			"name": "pro_",
+			"path": ".."
+		}
+	],
+	"settings": {
+		"liveServer.settings.multiRootWorkspaceName": "pro_"
+	}
+}
