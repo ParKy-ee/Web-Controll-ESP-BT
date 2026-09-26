@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": ".pio"
+		},
+		{
+			"name": "Code",
+			"path": "."
+		}
+	],
+	"settings": {
+		"liveServer.settings.multiRootWorkspaceName": "Code"
+	}
+}

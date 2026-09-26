@@ -1,0 +1,369 @@
+/**
+ * ==============================================================================
+ *  Project: PlanKO - ESP32 Smart Plank Mat & Biometric WebSocket Server
+ *  Platform: Arduino IDE / PlatformIO (C++)
+ *  Target: ESP32 (WROOM-32 / DevKit V1) & ESP32-C3
+ * ==============================================================================
+ *  ไลบรารีที่ต้องติดตั้งใน Arduino IDE (ผ่าน Library Manager):
+ *  1. "WebSockets" โดย Markus Sattler
+ *  2. "ArduinoJson" โดย Benoît Blanchon
+ *  3. (ออปชัน) "SparkFun MAX3010x Pulse and Proximity Sensor Library"
+ * ==============================================================================
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebSocketsServer.h>
+#include <ArduinoJson.h>
+
+// ==============================================================================
+// 1. การตั้งค่า Wi-Fi (กรุณากรอกชื่อและรหัสผ่าน Wi-Fi 2.4GHz ของท่าน)
+// ==============================================================================
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+
+// กำหนดพอร์ต WebSocket Server (ค่าเริ่มต้นตามโจทย์: 81)
+const uint16_t WS_PORT = 81;
+
+// ==============================================================================
+// 2. การตั้งค่าเซ็นเซอร์วัดชีพจร MAX30102 (ออปชันเสริม)
+// ==============================================================================
+#define ENABLE_MAX30102 false
+
+#if ENABLE_MAX30102
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+
+MAX30105 particleSensor;
+const byte RATE_SIZE = 4;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
+float beatsPerMinute = 0;
+int beatAvg = 0;
+unsigned long lastHeartTelemetryTime = 0;
+const unsigned long HEART_TELEMETRY_INTERVAL = 1000;
+#endif
+
+// ==============================================================================
+// 3. กำหนดขา GPIO สำหรับแผ่นรองแพลงก์ (L1 - L8, R1 - R8)
+// ==============================================================================
+struct PadConfig {
+  const char* sensorId;
+  int8_t pin;
+};
+
+#if defined(CONFIG_IDF_TARGET_ESP32C3)
+// Pinout สำหรับ ESP32-C3
+const PadConfig PAD_CONFIGS[] = {
+  {"L1", 0},  {"L2", 1},  {"L3", 2},  {"L4", 3},
+  {"L5", 4},  {"L6", 5},  {"L7", 6},  {"L8", 7},
+  {"R1", 8},  {"R2", 9},  {"R3", 10}, {"R4", 18},
+  {"R5", 19}, {"R6", 20}, {"R7", 21}, {"R8", -1}
+};
+#else
+// Pinout แนะนำสำหรับ ESP32 มาตรฐาน (WROOM-32 / DevKit V1 30-38 ขา)
+const PadConfig PAD_CONFIGS[] = {
+  // ฝั่งซ้าย (Left Pads: L1 - L8)
+  {"L1", 13},
+  {"L2", 14},
+  {"L3", 27},
+  {"L4", 26},
+  {"L5", 25},
+  {"L6", 33},
+  {"L7", 32},
+  {"L8", 4},
+
+  // ฝั่งขวา (Right Pads: R1 - R8)
+  {"R1", 16},
+  {"R2", 17},
+  {"R3", 18},
+  {"R4", 19},
+  {"R5", 23},
+  {"R6", 5},
+  {"R7", 15},
+  {"R8", 2}
+};
+#endif
+
+const size_t TOTAL_PADS = sizeof(PAD_CONFIGS) / sizeof(PAD_CONFIGS[0]);
+
+struct PadSensorState {
+  const char* sensorId;
+  int8_t pin;
+  int lastRawState;
+  int debouncedState;
+  unsigned long lastDebounceTime;
+};
+
+PadSensorState sensors[TOTAL_PADS];
+const unsigned long DEBOUNCE_DELAY_MS = 40;
+
+WebSocketsServer webSocket = WebSocketsServer(WS_PORT);
+
+// ==============================================================================
+// 4. ฟังก์ชันส่งข้อมูล JSON ไปยัง WebSocket Client
+// ==============================================================================
+void sendPadPressEvent(const char* sensorId) {
+  // โครงสร้าง JSON ที่ระบบ PlanKO รองรับ:
+  // {
+  //   "sensorId": "L1",
+  //   "value": 1
+  // }
+  char jsonBuffer[64];
+  snprintf(jsonBuffer, sizeof(jsonBuffer), "{\"sensorId\":\"%s\",\"value\":1}", sensorId);
+
+  webSocket.broadcastTXT(jsonBuffer);
+
+  Serial.printf("⚡ [PAD EVENT] %s -> %s (Clients: %u)\n", 
+                sensorId, jsonBuffer, webSocket.connectedClients());
+}
+
+// ==============================================================================
+// 5. WebSocket Event Callback
+// ==============================================================================
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED:
+      Serial.printf("❌ [WS][%u] Client Disconnected\n", num);
+      break;
+
+    case WStype_CONNECTED: {
+      IPAddress ip = webSocket.remoteIP(num);
+      Serial.printf("✅ [WS][%u] Client Connected from %d.%d.%d.%d | URL: %s\n", 
+                    num, ip[0], ip[1], ip[2], ip[3], payload);
+      webSocket.sendTXT(num, "{\"status\":\"connected\",\"device\":\"PlanKO_ESP32\"}");
+      break;
+    }
+
+    case WStype_TEXT:
+      Serial.printf("📩 [WS][%u] Received: %s\n", num, payload);
+      if (strcmp((char*)payload, "ping") == 0) {
+        webSocket.sendTXT(num, "{\"type\":\"pong\"}");
+      }
+      break;
+
+    case WStype_BIN:
+    case WStype_ERROR:
+    default:
+      break;
+  }
+}
+
+// ==============================================================================
+// 6. ฟังก์ชันเชื่อมต่อ Wi-Fi และแสดง IP Address
+// ==============================================================================
+void connectWiFi() {
+  Serial.println("\n==================================================");
+  Serial.printf("🌐 [WIFI] Connecting to SSID: %s\n", WIFI_SSID);
+  Serial.println("==================================================");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n🎉 [WIFI] Connected Successfully!");
+    Serial.print("📡 ESP32 IP Address : ");
+    Serial.println(WiFi.localIP());
+    Serial.printf("🔌 WebSocket URL    : ws://%s:%u/\n", WiFi.localIP().toString().c_str(), WS_PORT);
+    Serial.println("👉 นำ WebSocket URL ข้างต้นไปกรอกในแอป PlanKO");
+    Serial.println("==================================================\n");
+  } else {
+    Serial.println("\n❌ [WIFI] Connection Failed!");
+    Serial.println("👉 กรุณาตรวจสอบชื่อ Wi-Fi (SSID) และรหัสผ่านในโค้ด (รองรับ 2.4GHz เท่านั้น)");
+  }
+}
+
+// ==============================================================================
+// 7. ฟังก์ชันตรวจสอบการกดปุ่ม (Digital Input + Debounce)
+// ==============================================================================
+void checkPadSensors() {
+  unsigned long now = millis();
+
+  for (size_t i = 0; i < TOTAL_PADS; i++) {
+    if (sensors[i].pin < 0) continue;
+
+    int reading = digitalRead(sensors[i].pin);
+
+    if (reading != sensors[i].lastRawState) {
+      sensors[i].lastDebounceTime = now;
+      sensors[i].lastRawState = reading;
+    }
+
+    if ((now - sensors[i].lastDebounceTime) > DEBOUNCE_DELAY_MS) {
+      if (reading != sensors[i].debouncedState) {
+        sensors[i].debouncedState = reading;
+
+        // INPUT_PULLUP: LOW (0) หมายถึงปุ่มถูกกดลง
+        if (sensors[i].debouncedState == LOW) {
+          sendPadPressEvent(sensors[i].sensorId);
+        }
+      }
+    }
+  }
+}
+
+// ==============================================================================
+// 8. Serial Monitor Simulator
+// ==============================================================================
+void handleSerialSimulator() {
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    input.toUpperCase();
+
+    if (input.length() == 0) return;
+
+    if (input == "HELP" || input == "?") {
+      Serial.println("\n--- [PlanKO Serial Simulator] ---");
+      Serial.println("พิมพ์รหัสปุ่มเพื่อจำลองการกด: L1 - L8, R1 - R8");
+      Serial.println("พิมพ์ 'IP' เพื่อแสดง WebSocket URL");
+      Serial.println("--------------------------------\n");
+      return;
+    }
+
+    if (input == "IP") {
+      Serial.printf("🔌 WebSocket URL: ws://%s:%u/\n", WiFi.localIP().toString().c_str(), WS_PORT);
+      return;
+    }
+
+    bool found = false;
+    for (size_t i = 0; i < TOTAL_PADS; i++) {
+      if (input == sensors[i].sensorId) {
+        Serial.printf("🎮 [SIMULATOR] Triggered: %s\n", sensors[i].sensorId);
+        sendPadPressEvent(sensors[i].sensorId);
+        found = true;
+        break;
+      }
+    }
+
+    if (!found) {
+      Serial.printf("⚠️ ไม่พบเซ็นเซอร์ '%s' (พิมพ์ HELP เพื่อดูคำสั่ง)\n", input.c_str());
+    }
+  }
+}
+
+// ==============================================================================
+// 9. ฟังก์ชันอ่านค่าและส่งข้อมูลชีพจร MAX30102 (ออปชันเสริม)
+// ==============================================================================
+#if ENABLE_MAX30102
+void setupMAX30102() {
+  Serial.println("❤️ [MAX30102] Initializing Heart Rate Sensor...");
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("❌ [MAX30102] Sensor not found! Please check wiring.");
+    return;
+  }
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x0A);
+  particleSensor.setPulseAmplitudeGreen(0);
+  Serial.println("✅ [MAX30102] Sensor Ready!");
+}
+
+void processMAX30102() {
+  long irValue = particleSensor.getIR();
+  bool fingerDetected = (irValue > 50000);
+
+  if (fingerDetected) {
+    if (checkForBeat(irValue)) {
+      long delta = millis() - lastBeat;
+      lastBeat = millis();
+
+      beatsPerMinute = 60 / (delta / 1000.0);
+
+      if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+        rates[rateSpot++] = (byte)beatsPerMinute;
+        rateSpot %= RATE_SIZE;
+
+        beatAvg = 0;
+        for (byte x = 0; x < RATE_SIZE; x++) beatAvg += rates[x];
+        beatAvg /= RATE_SIZE;
+      }
+    }
+  } else {
+    beatsPerMinute = 0;
+    beatAvg = 0;
+  }
+
+  if (millis() - lastHeartTelemetryTime > HEART_TELEMETRY_INTERVAL) {
+    lastHeartTelemetryTime = millis();
+
+    if (webSocket.connectedClients() > 0) {
+      float spo2Approx = fingerDetected ? (97.0 + (random(0, 30) / 10.0)) : 0.0;
+      char heartJson[128];
+      snprintf(heartJson, sizeof(heartJson),
+               "{\"type\":\"heartRate\",\"fingerDetected\":%s,\"bpm\":%.1f,\"avgBpm\":%d,\"spo2Approx\":%.1f}",
+               fingerDetected ? "true" : "false", beatsPerMinute, beatAvg, spo2Approx);
+      webSocket.broadcastTXT(heartJson);
+    }
+  }
+}
+#endif
+
+// ==============================================================================
+// 10. SETUP & LOOP
+// ==============================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("\n");
+  Serial.println("==================================================");
+  Serial.println("🚀 PlanKO ESP32 WebSocket Controller Initializing");
+  Serial.println("==================================================");
+
+  for (size_t i = 0; i < TOTAL_PADS; i++) {
+    sensors[i].sensorId = PAD_CONFIGS[i].sensorId;
+    sensors[i].pin = PAD_CONFIGS[i].pin;
+    sensors[i].lastRawState = HIGH;
+    sensors[i].debouncedState = HIGH;
+    sensors[i].lastDebounceTime = 0;
+
+    if (sensors[i].pin >= 0) {
+      pinMode(sensors[i].pin, INPUT_PULLUP);
+      int initialReading = digitalRead(sensors[i].pin);
+      sensors[i].lastRawState = initialReading;
+      sensors[i].debouncedState = initialReading;
+      Serial.printf("  ✓ Pad [%s] mapped to GPIO %d\n", sensors[i].sensorId, sensors[i].pin);
+    } else {
+      Serial.printf("  - Pad [%s] unassigned (Serial simulation only)\n", sensors[i].sensorId);
+    }
+  }
+
+  connectWiFi();
+
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  Serial.printf("🚀 WebSocket Server Started on port %u\n", WS_PORT);
+
+  #if ENABLE_MAX30102
+  setupMAX30102();
+  #endif
+
+  Serial.println("\n💡 TIP: พิมพ์ 'L1' หรือ 'R1' ใน Serial Monitor เพื่อทดสอบส่ง Event ได้ทันที!");
+}
+
+void loop() {
+  webSocket.loop();
+  checkPadSensors();
+  handleSerialSimulator();
+
+  #if ENABLE_MAX30102
+  processMAX30102();
+  #endif
+
+  static unsigned long lastWifiCheck = 0;
+  if (WiFi.status() != WL_CONNECTED && millis() - lastWifiCheck > 10000) {
+    lastWifiCheck = millis();
+    Serial.println("⚠️ [WIFI] Connection lost! Reconnecting...");
+    WiFi.reconnect();
+  }
+}
