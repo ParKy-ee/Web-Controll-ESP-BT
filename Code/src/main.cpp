@@ -1,103 +1,240 @@
 /**
  * ==============================================================================
- *  Project: PlanKO - ESP32 Smart Plank Mat & Biometric WebSocket Server
- *  Platform: PlatformIO / Arduino IDE (C++)
- *  Target: ESP32 / ESP32-DevKit / ESP32-C3
- * ==============================================================================
- *  ฟังก์ชันการทำงาน:
- *  1. เชื่อมต่อ Wi-Fi ในเครือข่าย Local LAN
- *  2. เปิด WebSocket Server ที่ Port 81 (ws://<ESP32_IP>:81/)
- *  3. ตรวจจับการกดแผ่นรองแพลงก์ (Plank Pads) ปุ่มฝั่งซ้าย (L1 - L8) และขวา (R1 - R8)
- *     - ใช้งานแบบ INPUT_PULLUP (Active-LOW: ต่อปุ่มลง GND)
- *     - มีระบบ Software Debounce ป้องกันการกระดอนของสัญญาณ
- *  4. ส่งข้อมูล JSON แบบ Real-time ทันทีที่มีการกด:
- *     {"sensorId":"L1","value":1}
- *  5. Serial Simulator: สามารถพิมพ์ "L1", "R3" ฯลฯ ใน Serial Monitor
- * เพื่อจำลองการกดได้ทันที
- *  6. (ออปชันเสริม) รองรับ MAX30102 สำหรับอ่านค่าอัตราการเต้นของหัวใจ (BPM) และ SpO2
+ * Project: PlanKO - Smart Plank Training System
+ * Hardware: ESP32-C3 (DevKitM-1 / SuperMini)
+ *
+ * Supports 2 Unified Roles via PlatformIO build flags:
+ *   1. ROLE_GATEWAY:
+ *      - BLE Central (connects to up to 4 IMU Nodes via BLE GATT)
+ *      - Wi-Fi Station + WebSocket Server on Port 81
+ *      - 16-pad Smart Mat Switch Inputs + Debounce + Serial Simulator
+ *      - (Optional) MAX30102 Pulse Oximeter
+ *      - Broadcasts consolidated IMU + Touch events to Expo App
+ *
+ *   2. ROLE_NODE:
+ *      - BLE Peripheral (Advertises as PlanKO_IMU_1 .. PlanKO_IMU_4)
+ *      - Reads MPU-6050 6-DOF IMU over I2C (SDA=4, SCL=5)
+ *      - Computes Pitch, Roll, Yaw via Complementary Filter
+ *      - Transmits 20-byte binary ImuPacket via BLE Notifications
  * ==============================================================================
  */
 
+#include "common_types.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <WebSocketsServer.h>
-#include <WiFi.h>
-
-// ==============================================================================
-// 1. การตั้งค่า Wi-Fi (กรุณากรอกชื่อและรหัสผ่าน Wi-Fi 2.4GHz ของท่าน)
-// ==============================================================================
-const char *WIFI_SSID = "APISIT164 @2.4G";
-const char *WIFI_PASS = "09E2898E";
-
-// กำหนดพอร์ต WebSocket Server (ค่าเริ่มต้นตามโจทย์: 81)
-const uint16_t WS_PORT = 81;
-
-// ==============================================================================
-// 2. การตั้งค่าเซ็นเซอร์วัดชีพจร MAX30102 (ออปชันเสริม)
-// ==============================================================================
-// ตั้งค่าเป็น true หากต่อเซ็นเซอร์ MAX30102 ผ่าน I2C (SDA/SCL)
-#define ENABLE_MAX30102 false
-
-#if ENABLE_MAX30102
-#include "MAX30105.h"
-#include "heartRate.h"
 #include <Wire.h>
 
-MAX30105 particleSensor;
-const byte RATE_SIZE = 4;
-byte rates[RATE_SIZE];
-byte rateSpot = 0;
-long lastBeat = 0;
-float beatsPerMinute = 0;
-int beatAvg = 0;
-unsigned long lastHeartTelemetryTime = 0;
-const unsigned long HEART_TELEMETRY_INTERVAL = 1000; // ส่งข้อมูลทุก 1 วินาที
+#if defined(ROLE_NODE)
+// ==============================================================================
+// ------------------------------ ROLE: IMU NODE
+// --------------------------------
+// ==============================================================================
+#include "mpu6050_reader.h"
+#include <NimBLEDevice.h>
+
+#ifndef NODE_ID
+#define NODE_ID 1
 #endif
 
-// ==============================================================================
-// 3. กำหนดขา GPIO สำหรับแผ่นรองแพลงก์ (L1 - L8, R1 - R8)
-// ==============================================================================
-// หมายเหตุ: สวิตช์ต่อแบบ INPUT_PULLUP (ปุ่มกดต่อเข้า GPIO และปลายอีกข้างต่อ GND)
-// เมื่อกดปุ่ม สถานะจะเป็น LOW (0), ปล่อยปุ่มจะเป็น HIGH (1)
-struct PadConfig {
-  const char *sensorId;
-  int8_t pin; // -1 หมายถึงไม่ได้ต่อขาจริง (ยังสามารถจำลองผ่าน Serial ได้)
+#ifndef I2C_SDA_PIN
+#define I2C_SDA_PIN 4
+#endif
+
+#ifndef I2C_SCL_PIN
+#define I2C_SCL_PIN 5
+#endif
+
+// Sampling frequency: 50Hz (20ms)
+const unsigned long SAMPLE_INTERVAL_MS = 20;
+
+Mpu6050Reader imu;
+NimBLEServer *pServer = nullptr;
+NimBLECharacteristic *pImuCharacteristic = nullptr;
+bool bleConnected = false;
+uint16_t packetSequence = 0;
+unsigned long lastSampleTime = 0;
+unsigned long lastSerialPrintTime = 0;
+
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *pServer) override {
+    bleConnected = true;
+    Serial.println("🔗 [BLE] Gateway Central Connected!");
+  }
+  void onDisconnect(NimBLEServer *pServer) override {
+    bleConnected = false;
+    Serial.println(
+        "🔌 [BLE] Gateway Central Disconnected. Restarting Advertising...");
+    NimBLEDevice::startAdvertising();
+  }
 };
 
-#if defined(CONFIG_IDF_TARGET_ESP32C3)
-// Pinout สำหรับ ESP32-C3 (จำนวนขามีจำกัด)
-const PadConfig PAD_CONFIGS[] = {
-    {"L1", 0},  {"L2", 1},  {"L3", 2},  {"L4", 3}, {"L5", 4},  {"L6", 5},
-    {"L7", 6},  {"L8", 7},  {"R1", 8},  {"R2", 9}, {"R3", 10}, {"R4", 18},
-    {"R5", 19}, {"R6", 20}, {"R7", 21}, {"R8", -1}};
-#else
-// Pinout แนะนำสำหรับ ESP32 มาตรฐาน (ESP32-WROOM-32 / DevKit V1 30-38 ขา)
-// ทุกขาที่เลือกนี้รองรับวงจร Internal Pull-up ปลอดภัยต่อการบูต
-const PadConfig PAD_CONFIGS[] = {
-    // ฝั่งซ้าย (Left Pads: L1 - L8)
-    {"L1", 13},
-    {"L2", 14},
-    {"L3", 27},
-    {"L4", 26},
-    {"L5", 25},
-    {"L6", 33},
-    {"L7", 32},
-    {"L8", 4},
+void printNodeBanner() {
+  Serial.println(
+      "\n****************************************************************");
+  Serial.printf("🤖 [PlanKO IMU Node #%d] Firmware Started!\n", NODE_ID);
+  Serial.printf("📡 BLE Advertising Name: PlanKO_IMU_%d\n", NODE_ID);
+  Serial.printf("🔌 I2C Pins: SDA = GPIO %d, SCL = GPIO %d\n", I2C_SDA_PIN,
+                I2C_SCL_PIN);
+  Serial.println("💡 Type 'CAL' in Serial Monitor to re-calibrate IMU sensor");
+  Serial.println(
+      "****************************************************************\n");
+}
 
-    // ฝั่งขวา (Right Pads: R1 - R8)
-    {"R1", 16},
-    {"R2", 17},
-    {"R3", 18},
-    {"R4", 19},
-    {"R5", 23},
-    {"R6", 5},
-    {"R7", 15},
-    {"R8", 2}};
-#endif
+void setup() {
+  Serial.begin(115200);
+  Serial.setTxTimeoutMs(0);
+  delay(1000);
+
+  printNodeBanner();
+
+  // 1. Initialize MPU-6050 IMU
+  Serial.println("🔍 [IMU] Initializing MPU-6050...");
+  if (!imu.begin(I2C_SDA_PIN, I2C_SCL_PIN)) {
+    Serial.println("❌ [IMU] MPU-6050 not detected. Retrying in background...");
+  }
+
+  // 2. Initialize NimBLE Peripheral
+  char bleName[20];
+  snprintf(bleName, sizeof(bleName), "PlanKO_IMU_%d", NODE_ID);
+  NimBLEDevice::init(bleName);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9); // Maximum TX power
+
+  pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  NimBLEService *pService = pServer->createService(PLANKO_SERVICE_UUID);
+  pImuCharacteristic = pService->createCharacteristic(
+      PLANKO_CHARACTERISTIC_UUID,
+      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+
+  pService->start();
+
+  NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(PLANKO_SERVICE_UUID);
+  pAdvertising->setName(bleName);
+  pAdvertising->start();
+
+  Serial.printf("🚀 [BLE] Advertising as '%s' - Waiting for Gateway...\n",
+                bleName);
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // Check for Serial commands (e.g. CAL)
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    cmd.toUpperCase();
+    if (cmd == "CAL") {
+      imu.calibrate();
+    }
+  }
+
+  // Read IMU and send BLE Notification
+  if (now - lastSampleTime >= SAMPLE_INTERVAL_MS) {
+    lastSampleTime = now;
+
+    float curPitch = 0.0f;
+    float curRoll = 0.0f;
+    float curYaw = 0.0f;
+    float curAx = 0.0f;
+    float curAy = 0.0f;
+    float curAz = 9.8f;
+    uint8_t curStatus = 0;
+
+    if (imu.isDetected) {
+      imu.update();
+      curPitch = imu.pitch;
+      curRoll = imu.roll;
+      curYaw = imu.yaw;
+      curAx = imu.ax;
+      curAy = imu.ay;
+      curAz = imu.az;
+      curStatus = imu.isCalibrated ? 1 : 0;
+    } else {
+      // [MOCK SIMULATION] ระบุชัดเจนว่าเป็น Mock (จำลองการสั่นไหวและมุมเอียงของ Plank)
+      imu.update(); // Keeps background auto-detect active
+      float t = now / 1000.0f;
+      curPitch = sinf(t * 1.2f + (NODE_ID * 0.5f)) * 3.5f;
+      curRoll = cosf(t * 0.8f + (NODE_ID * 0.3f)) * 2.0f;
+      curYaw = sinf(t * 0.2f) * 1.0f;
+      curAx = sinf(t * 1.5f) * 0.1f;
+      curAy = cosf(t * 1.5f) * 0.1f;
+      curAz = 9.8f + sinf(t * 1.2f) * 0.05f;
+      curStatus = 2; // 2 = MOCK DATA
+    }
+
+    if (bleConnected && pImuCharacteristic != nullptr) {
+      ImuPacket pkt;
+      pkt.nodeId = NODE_ID;
+      pkt.sequence = ++packetSequence;
+      pkt.timestamp = now;
+      pkt.pitch = (int16_t)(curPitch * 100.0f);
+      pkt.roll = (int16_t)(curRoll * 100.0f);
+      pkt.yaw = (int16_t)(curYaw * 100.0f);
+      pkt.ax = (int16_t)(curAx * 100.0f);
+      pkt.ay = (int16_t)(curAy * 100.0f);
+      pkt.az = (int16_t)(curAz * 100.0f);
+      pkt.status = curStatus;
+
+      pImuCharacteristic->setValue((uint8_t *)&pkt, sizeof(pkt));
+      pImuCharacteristic->notify();
+    }
+  }
+
+  // Print telemetry to Serial once every 2 seconds
+  if (now - lastSerialPrintTime >= 2000) {
+    lastSerialPrintTime = now;
+    float displayPitch =
+        imu.isDetected ? imu.pitch
+                       : (sinf(now / 1000.0f * 1.2f + (NODE_ID * 0.5f)) * 3.5f);
+    float displayRoll =
+        imu.isDetected ? imu.roll
+                       : (cosf(now / 1000.0f * 0.8f + (NODE_ID * 0.3f)) * 2.0f);
+    Serial.printf(
+        "📊 [Node #%d]%s Pitch: %5.1f° | Roll: %5.1f° | BLE: %s | Seq: %u\n",
+        NODE_ID, imu.isDetected ? " [REAL IMU]" : " [MOCK SIMULATOR]",
+        displayPitch, displayRoll, bleConnected ? "CONNECTED" : "ADVERTISING",
+        packetSequence);
+  }
+}
+
+#elif defined(ROLE_GATEWAY)
+// ==============================================================================
+// ----------------------------- ROLE: GATEWAY
+// ----------------------------------
+// ==============================================================================
+#include <NimBLEDevice.h>
+#include <WebSocketsServer.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+
+// Wi-Fi Configuration
+const char *WIFI_SSID = "APISIT164 @2.4G";
+const char *WIFI_PASS = "09E2898E";
+const uint16_t WS_PORT = 81;
+
+// Static IP Configuration
+IPAddress STATIC_IP(192, 168, 1, 200);
+IPAddress GATEWAY_IP(192, 168, 1, 1);
+IPAddress SUBNET_MASK(255, 255, 255, 0);
+IPAddress DNS_PRIMARY(192, 168, 1, 1);
+IPAddress DNS_SECONDARY(8, 8, 8, 8);
+
+// 16-Pad GPIO Hardware Configuration (ESP32-C3 Safe Pins)
+struct PadConfig {
+  const char *name;
+  int8_t pin;
+};
+
+const PadConfig PAD_CONFIGS[] = {
+    {"L1", 0},  {"L2", 1},  {"L3", 2},  {"L4", 3},  {"L5", 4},  {"L6", 5},
+    {"L7", 6},  {"L8", 7},  {"R1", 10}, {"R2", -1}, {"R3", -1}, {"R4", -1},
+    {"R5", -1}, {"R6", -1}, {"R7", -1}, {"R8", -1}};
 
 const size_t TOTAL_PADS = sizeof(PAD_CONFIGS) / sizeof(PAD_CONFIGS[0]);
 
-// โครงสร้างข้อมูลสำหรับจัดเก็บสถานะและการทำ Software Debounce ของแต่ละปุ่ม
 struct PadSensorState {
   const char *sensorId;
   int8_t pin;
@@ -107,314 +244,530 @@ struct PadSensorState {
 };
 
 PadSensorState sensors[TOTAL_PADS];
-const unsigned long DEBOUNCE_DELAY_MS = 40; // หน่วงเวลา Debounce 40 ms
+const unsigned long DEBOUNCE_DELAY_MS = 40;
 
-// WebSocket Server Object
+// WebSocket Server
 WebSocketsServer webSocket = WebSocketsServer(WS_PORT);
 
-// ==============================================================================
-// 4. ฟังก์ชันส่งข้อมูล JSON ไปยัง WebSocket Client
-// ==============================================================================
-void sendPadPressEvent(const char *sensorId) {
-  // สร้าง JSON ตามโครงสร้างที่ PlanKO กำหนด:
-  // {
-  //   "sensorId": "L1",
-  //   "value": 1
-  // }
-  char jsonBuffer[64];
-  snprintf(jsonBuffer, sizeof(jsonBuffer), "{\"sensorId\":\"%s\",\"value\":1}",
-           sensorId);
+// BLE Central State for 4 IMU Nodes
+const int MAX_NODES = 4;
+NodeTelemetry nodesTelemetry[MAX_NODES];
+NimBLEClient *pNodeClients[MAX_NODES] = {nullptr, nullptr, nullptr, nullptr};
+NimBLEAdvertisedDevice *pendingConnectDevices[MAX_NODES] = {nullptr, nullptr,
+                                                            nullptr, nullptr};
 
-  // Broadcast กระจายข้อมูลไปยังแอป PlanKO หรือ Client ทุกเครื่องที่เชื่อมต่อ
-  webSocket.broadcastTXT(jsonBuffer);
+unsigned long lastWsStreamTime = 0;
+const unsigned long WS_STREAM_INTERVAL_MS = 50; // 20Hz WebSocket Broadcast
+unsigned long lastBleScanTime = 0;
+const unsigned long STALE_TIMEOUT_MS = 3000; // Force disconnect if no data for 3s
+bool isScanning = false;
 
-  Serial.printf("⚡ [PAD EVENT] %s -> %s (Connected Clients: %u)\n", sensorId,
-                jsonBuffer, webSocket.connectedClients());
+// Forward declaration
+void sendPadPressEvent(const char *sensorId);
+void broadcastImuStream();
+
+// BLE Client Callbacks
+class GatewayClientCallbacks : public NimBLEClientCallbacks {
+public:
+  uint8_t nodeId;
+  GatewayClientCallbacks(uint8_t id) : nodeId(id) {}
+
+  void onConnect(NimBLEClient *pClient) override {
+    Serial.printf("✅ [GATEWAY-BLE] Connected to IMU Node #%d\n", nodeId);
+    nodesTelemetry[nodeId - 1].connected = true;
+  }
+
+  void onDisconnect(NimBLEClient *pClient) override {
+    Serial.printf("❌ [GATEWAY-BLE] Disconnected from IMU Node #%d\n", nodeId);
+    nodesTelemetry[nodeId - 1].connected = false;
+  }
+};
+
+// BLE Notification Callback for receiving ImuPacket from Nodes
+void notifyCallback(NimBLERemoteCharacteristic *pRemoteChar, uint8_t *pData,
+                    size_t length, bool isNotify) {
+  if (length < sizeof(ImuPacket))
+    return;
+
+  const ImuPacket *pkt = (const ImuPacket *)pData;
+  if (pkt->nodeId < 1 || pkt->nodeId > MAX_NODES)
+    return;
+
+  int idx = pkt->nodeId - 1;
+  NodeTelemetry &telemetry = nodesTelemetry[idx];
+
+  // Check packet drop sequence
+  if (telemetry.lastSequence != 0 &&
+      pkt->sequence > telemetry.lastSequence + 1) {
+    uint16_t dropped = (pkt->sequence - telemetry.lastSequence - 1);
+    telemetry.totalDropped += dropped;
+    Serial.printf(
+        "⚠️ [GATEWAY-BLE] Node #%d Dropped %u packets (Seq: %u -> %u)\n",
+        pkt->nodeId, dropped, telemetry.lastSequence, pkt->sequence);
+  }
+  telemetry.lastSequence = pkt->sequence;
+  telemetry.lastTimestamp = pkt->timestamp;
+  telemetry.pitch = pkt->pitch / 100.0f;
+  telemetry.roll = pkt->roll / 100.0f;
+  telemetry.yaw = pkt->yaw / 100.0f;
+  telemetry.ax = pkt->ax / 100.0f;
+  telemetry.ay = pkt->ay / 100.0f;
+  telemetry.az = pkt->az / 100.0f;
+  telemetry.status = pkt->status;
+  telemetry.lastReceivedMillis = millis();
+
+  // Log live telemetry from node (rate-limited to 1s per node)
+  static unsigned long lastNodeLogTime[MAX_NODES] = {0, 0, 0, 0};
+  if (millis() - lastNodeLogTime[idx] >= 1000) {
+    lastNodeLogTime[idx] = millis();
+    Serial.printf("📥 [GW-RECV] Node #%d%s | Seq: %5u | Pitch: %5.1f° | Roll: "
+                  "%5.1f° | Yaw: %5.1f° | Drops: %u\n",
+                  pkt->nodeId, (pkt->status == 2) ? " [MOCK]" : " [REAL]",
+                  pkt->sequence, telemetry.pitch, telemetry.roll, telemetry.yaw,
+                  telemetry.totalDropped);
+  }
 }
 
-// ==============================================================================
-// 5. WebSocket Event Callback
-// ==============================================================================
+// Advertised Device Callback
+class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
+  void onResult(NimBLEAdvertisedDevice *advertisedDevice) override {
+    std::string name = advertisedDevice->getName();
+    if (name.rfind("PlanKO_IMU_", 0) == 0) { // Name starts with PlanKO_IMU_
+      int id = name[11] - '0';
+      if (id >= 1 && id <= MAX_NODES) {
+        int idx = id - 1;
+        if (!nodesTelemetry[idx].connected &&
+            pendingConnectDevices[idx] == nullptr) {
+          Serial.printf("🔎 [GATEWAY-BLE] Found Node #%d ('%s') RSSI: %d\n", id,
+                        name.c_str(), advertisedDevice->getRSSI());
+          pendingConnectDevices[idx] =
+              new NimBLEAdvertisedDevice(*advertisedDevice);
+        }
+      }
+    }
+  }
+};
+
+void resumeBleScanIfNeeded() {
+  bool needMoreNodes = false;
+  for (int i = 0; i < MAX_NODES; i++) {
+    if (!nodesTelemetry[i].connected)
+      needMoreNodes = true;
+  }
+  NimBLEScan *pScan = NimBLEDevice::getScan();
+  if (needMoreNodes && pScan && !pScan->isScanning()) {
+    pScan->start(0, false);
+  }
+}
+
+void connectToNode(int idx) {
+  int id = idx + 1;
+  NimBLEAdvertisedDevice *advDevice = pendingConnectDevices[idx];
+  if (advDevice == nullptr)
+    return;
+
+  Serial.printf("⏳ [GATEWAY-BLE] Connecting to Node #%d...\n", id);
+
+  // Stop scanning before connecting to avoid radio contention
+  NimBLEScan *pScan = NimBLEDevice::getScan();
+  if (pScan && pScan->isScanning()) {
+    pScan->stop();
+  }
+
+  NimBLEClient *pClient = pNodeClients[idx];
+  if (pClient == nullptr) {
+    pClient = NimBLEDevice::createClient();
+    pClient->setClientCallbacks(new GatewayClientCallbacks(id), false);
+    pClient->setConnectionParams(12, 12, 0, 150); // Low latency connection
+    pClient->setConnectTimeout(5);
+    pNodeClients[idx] = pClient;
+  }
+
+  if (!pClient->isConnected()) {
+    if (!pClient->connect(advDevice)) {
+      Serial.printf(
+          "❌ [GATEWAY-BLE] Failed to connect to Node #%d (will retry)\n", id);
+      delete advDevice;
+      pendingConnectDevices[idx] = nullptr;
+      resumeBleScanIfNeeded();
+      return;
+    }
+  }
+
+  NimBLERemoteService *pRemoteService =
+      pClient->getService(PLANKO_SERVICE_UUID);
+  if (pRemoteService == nullptr) {
+    Serial.printf("❌ [GATEWAY-BLE] Failed to find service on Node #%d\n", id);
+    pClient->disconnect();
+    delete advDevice;
+    pendingConnectDevices[idx] = nullptr;
+    resumeBleScanIfNeeded();
+    return;
+  }
+
+  NimBLERemoteCharacteristic *pRemoteChar =
+      pRemoteService->getCharacteristic(PLANKO_CHARACTERISTIC_UUID);
+  if (pRemoteChar == nullptr || !pRemoteChar->canNotify()) {
+    Serial.printf(
+        "❌ [GATEWAY-BLE] Failed to find notify characteristic on Node #%d\n",
+        id);
+    pClient->disconnect();
+    delete advDevice;
+    pendingConnectDevices[idx] = nullptr;
+    resumeBleScanIfNeeded();
+    return;
+  }
+
+  if (!pRemoteChar->subscribe(true, notifyCallback)) {
+    Serial.printf(
+        "❌ [GATEWAY-BLE] Failed to subscribe to Node #%d notifications\n", id);
+    pClient->disconnect();
+    delete advDevice;
+    pendingConnectDevices[idx] = nullptr;
+    resumeBleScanIfNeeded();
+    return;
+  }
+
+  Serial.printf(
+      "🎉 [GATEWAY-BLE] Successfully subscribed to Node #%d telemetry!\n", id);
+  nodesTelemetry[idx].connected = true;
+  delete advDevice;
+  pendingConnectDevices[idx] = nullptr;
+
+  resumeBleScanIfNeeded();
+}
+
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload,
                     size_t length) {
   switch (type) {
   case WStype_DISCONNECTED:
     Serial.printf("❌ [WS][%u] Client Disconnected\n", num);
     break;
-
   case WStype_CONNECTED: {
     IPAddress ip = webSocket.remoteIP(num);
-    Serial.printf("✅ [WS][%u] Client Connected from %d.%d.%d.%d | URL: %s\n",
-                  num, ip[0], ip[1], ip[2], ip[3], payload);
-    // ส่งข้อความยืนยันการเชื่อมต่อไปยัง Client
-    webSocket.sendTXT(num,
-                      "{\"status\":\"connected\",\"device\":\"PlanKO_ESP32\"}");
+    Serial.printf("✅ [WS][%u] Client Connected from %d.%d.%d.%d\n", num, ip[0],
+                  ip[1], ip[2], ip[3]);
+    webSocket.sendTXT(
+        num, "{\"status\":\"connected\",\"device\":\"PlanKO_Gateway\"}");
     break;
   }
-
   case WStype_TEXT:
-    Serial.printf("📩 [WS][%u] Received Text: %s\n", num, payload);
-    // ตัวอย่างการรองรับคำสั่ง Ping-Pong
-    if (strcmp((char *)payload, "ping") == 0) {
-      webSocket.sendTXT(num, "{\"type\":\"pong\"}");
-    }
+    // Echo / Command handling
     break;
-
-  case WStype_BIN:
-  case WStype_ERROR:
   default:
     break;
   }
 }
 
-// ==============================================================================
-// 6. ฟังก์ชันเชื่อมต่อ Wi-Fi และแสดง IP Address
-// ==============================================================================
-void connectWiFi() {
-  Serial.println("\n==================================================");
-  Serial.printf("🌐 [WIFI] Connecting to SSID: %s\n", WIFI_SSID);
-  Serial.println("==================================================");
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n🎉 [WIFI] Connected Successfully!");
-    Serial.print("📡 ESP32 IP Address : ");
-    Serial.println(WiFi.localIP());
-    Serial.printf("🔌 WebSocket URL    : ws://%s:%u/\n",
-                  WiFi.localIP().toString().c_str(), WS_PORT);
-    Serial.println("👉 นำ WebSocket URL ข้างต้นไปกรอกในแอป PlanKO หรือ sensor.ts");
-    Serial.println("==================================================\n");
-  } else {
-    Serial.println("\n❌ [WIFI] Connection Failed!");
-    Serial.println(
-        "👉 กรุณาตรวจสอบชื่อ Wi-Fi (SSID) และรหัสผ่านในโค้ด (รองรับ 2.4GHz เท่านั้น)");
-  }
+void sendPadPressEvent(const char *sensorId) {
+  char jsonBuffer[64];
+  snprintf(jsonBuffer, sizeof(jsonBuffer), "{\"sensorId\":\"%s\",\"value\":1}",
+           sensorId);
+  webSocket.broadcastTXT(jsonBuffer);
+  Serial.printf("⚡ [PAD EVENT] %s (WS Clients: %u)\n", sensorId,
+                webSocket.connectedClients());
 }
 
-// ==============================================================================
-// 7. ฟังก์ชันตรวจสอบการกดปุ่ม (Digital Input + Debounce)
-// ==============================================================================
-void checkPadSensors() {
+void broadcastImuStream() {
+  if (webSocket.connectedClients() == 0)
+    return;
+
   unsigned long now = millis();
 
+  JsonDocument doc;
+  doc["type"] = "imu_stream";
+
+  JsonObject gw = doc["gateway"].to<JsonObject>();
+  gw["uptimeMs"] = now;
+
+  int connectedCount = 0;
+  JsonArray nodes = doc["nodes"].to<JsonArray>();
+  for (int i = 0; i < MAX_NODES; i++) {
+    if (!nodesTelemetry[i].connected || nodesTelemetry[i].lastReceivedMillis == 0)
+      continue;
+
+    // Snapshot to avoid race with BLE notification callback (separate FreeRTOS task)
+    unsigned long lastRecv = nodesTelemetry[i].lastReceivedMillis;
+    unsigned long elapsed = now - lastRecv;
+
+    // Guard: underflow produces ~4 billion, real stale is < 60s.
+    // Only include nodes with fresh data (received within STALE_TIMEOUT_MS)
+    if (elapsed > STALE_TIMEOUT_MS && elapsed < 60000UL)
+      continue; // Data is stale, skip this node
+
+    connectedCount++;
+    JsonObject n = nodes.add<JsonObject>();
+    n["nodeId"] = i + 1;
+    n["seq"] = nodesTelemetry[i].lastSequence;
+    n["ts"] = nodesTelemetry[i].lastTimestamp;
+    n["pitch"] = round(nodesTelemetry[i].pitch * 10.0f) / 10.0f;
+    n["roll"] = round(nodesTelemetry[i].roll * 10.0f) / 10.0f;
+    n["yaw"] = round(nodesTelemetry[i].yaw * 10.0f) / 10.0f;
+    n["dropped"] = nodesTelemetry[i].totalDropped;
+    n["isMock"] = (nodesTelemetry[i].status == 2);
+
+    JsonArray acc = n["accel"].to<JsonArray>();
+    acc.add(round(nodesTelemetry[i].ax * 100.0f) / 100.0f);
+    acc.add(round(nodesTelemetry[i].ay * 100.0f) / 100.0f);
+    acc.add(round(nodesTelemetry[i].az * 100.0f) / 100.0f);
+  }
+
+  gw["connectedNodes"] = connectedCount;
+
+  String output;
+  serializeJson(doc, output);
+  webSocket.broadcastTXT(output);
+}
+
+void handlePadInputs() {
+  unsigned long now = millis();
   for (size_t i = 0; i < TOTAL_PADS; i++) {
     if (sensors[i].pin < 0)
-      continue; // ข้ามขาที่ไม่ได้เชื่อมต่อฮาร์ดแวร์จริง
+      continue;
 
-    int reading = digitalRead(sensors[i].pin);
-
-    // ตรวจสอบการเปลี่ยนแปลงของสัญญาณ
-    if (reading != sensors[i].lastRawState) {
+    int rawReading = digitalRead(sensors[i].pin);
+    if (rawReading != sensors[i].lastRawState) {
       sensors[i].lastDebounceTime = now;
-      sensors[i].lastRawState = reading;
     }
 
-    // เมื่อสัญญาณนิ่งเกินระยะเวลา Debounce
     if ((now - sensors[i].lastDebounceTime) > DEBOUNCE_DELAY_MS) {
-      if (reading != sensors[i].debouncedState) {
-        sensors[i].debouncedState = reading;
-
-        // โหมด INPUT_PULLUP: สถานะ LOW (0) หมายถึงปุ่มถูกกดลง
+      if (rawReading != sensors[i].debouncedState) {
+        sensors[i].debouncedState = rawReading;
         if (sensors[i].debouncedState == LOW) {
           sendPadPressEvent(sensors[i].sensorId);
         }
       }
     }
+    sensors[i].lastRawState = rawReading;
   }
 }
 
-// ==============================================================================
-// 8. Serial Monitor Simulator (ระบบจำลองการกดปุ่มผ่านทาง Serial)
-// ==============================================================================
 void handleSerialSimulator() {
-  if (Serial.available()) {
-    String input = Serial.readStringUntil('\n');
-    input.trim();
-    input.toUpperCase();
+  if (!Serial.available())
+    return;
+  String input = Serial.readStringUntil('\n');
+  input.trim();
+  input.toUpperCase();
+  if (input.length() == 0)
+    return;
 
-    if (input.length() == 0)
-      return;
-
-    if (input == "HELP" || input == "?") {
-      Serial.println("\n--- [PlanKO Serial Simulator] ---");
-      Serial.println("พิมพ์รหัสปุ่มเพื่อจำลองการกดแผ่นแพลงก์ เช่น:");
-      Serial.println("  L1, L2, L3, L4, L5, L6, L7, L8 (ฝั่งซ้าย)");
-      Serial.println("  R1, R2, R3, R4, R5, R6, R7, R8 (ฝั่งขวา)");
-      Serial.println("พิมพ์ 'IP' เพื่อดู IP Address อีกครั้ง");
-      Serial.println("--------------------------------\n");
-      return;
-    }
-
-    if (input == "IP") {
-      Serial.printf("🔌 WebSocket URL: ws://%s:%u/\n",
-                    WiFi.localIP().toString().c_str(), WS_PORT);
-      return;
-    }
-
-    // ค้นหารหัสเซ็นเซอร์ที่ตรงกับที่ผู้ใช้พิมพ์
-    bool found = false;
-    for (size_t i = 0; i < TOTAL_PADS; i++) {
-      if (input == sensors[i].sensorId) {
-        Serial.printf("🎮 [SIMULATOR] Triggered Pad: %s\n",
-                      sensors[i].sensorId);
-        sendPadPressEvent(sensors[i].sensorId);
-        found = true;
-        break;
-      }
-    }
-
-    if (!found) {
-      Serial.printf("⚠️ ไม่พบเซ็นเซอร์ '%s' (พิมพ์ HELP เพื่อดูรายการปุ่มที่รองรับ)\n",
-                    input.c_str());
-    }
-  }
-}
-
-// ==============================================================================
-// 9. ฟังก์ชันอ่านค่าและส่งข้อมูลชีพจร MAX30102 (ออปชันเสริม)
-// ==============================================================================
-#if ENABLE_MAX30102
-void setupMAX30102() {
-  Serial.println("❤️ [MAX30102] Initializing Heart Rate Sensor...");
-  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
-    Serial.println("❌ [MAX30102] Sensor not found! Please check wiring.");
+  if (input == "HELP") {
+    Serial.println("\n--- [PlanKO Gateway Simulator] ---");
+    Serial.println("Type 'L1' - 'L8' or 'R1' - 'R8' to trigger pad event");
+    Serial.println("Type 'STATUS' to see connected BLE nodes & stats");
     return;
   }
-  particleSensor.setup();
-  particleSensor.setPulseAmplitudeRed(0x0A);
-  particleSensor.setPulseAmplitudeGreen(0);
-  Serial.println("✅ [MAX30102] Sensor Ready!");
-}
 
-void processMAX30102() {
-  long irValue = particleSensor.getIR();
-
-  // ตรวจจับการแตะนิ้ว (ค่า IR > 50,000 หมายถึงมีนิ้วแตะ)
-  bool fingerDetected = (irValue > 50000);
-
-  if (fingerDetected) {
-    if (checkForBeat(irValue)) {
-      long delta = millis() - lastBeat;
-      lastBeat = millis();
-
-      beatsPerMinute = 60 / (delta / 1000.0);
-
-      if (beatsPerMinute < 255 && beatsPerMinute > 20) {
-        rates[rateSpot++] = (byte)beatsPerMinute;
-        rateSpot %= RATE_SIZE;
-
-        beatAvg = 0;
-        for (byte x = 0; x < RATE_SIZE; x++)
-          beatAvg += rates[x];
-        beatAvg /= RATE_SIZE;
-      }
+  if (input == "STATUS") {
+    Serial.println("\n--- [Gateway Telemetry Status] ---");
+    for (int i = 0; i < MAX_NODES; i++) {
+      Serial.printf(
+          "  Node #%d: %s | Seq: %u | Dropped: %u | P:%.1f R:%.1f Y:%.1f\n",
+          i + 1, nodesTelemetry[i].connected ? "CONNECTED" : "OFFLINE",
+          nodesTelemetry[i].lastSequence, nodesTelemetry[i].totalDropped,
+          nodesTelemetry[i].pitch, nodesTelemetry[i].roll,
+          nodesTelemetry[i].yaw);
     }
-  } else {
-    beatsPerMinute = 0;
-    beatAvg = 0;
+    Serial.printf("  WS Clients: %u | Gateway IP: %s\n\n",
+                  webSocket.connectedClients(),
+                  WiFi.localIP().toString().c_str());
+    return;
   }
 
-  // ส่งข้อมูล Telemetry เป็นระยะ
-  if (millis() - lastHeartTelemetryTime > HEART_TELEMETRY_INTERVAL) {
-    lastHeartTelemetryTime = millis();
-
-    if (webSocket.connectedClients() > 0) {
-      // คำนวณ SpO2 คร่าวๆ (ประมาณการทางชีวภาพเบื้องต้น)
-      float spo2Approx = fingerDetected ? (97.0 + (random(0, 30) / 10.0)) : 0.0;
-
-      char heartJson[128];
-      snprintf(heartJson, sizeof(heartJson),
-               "{\"type\":\"heartRate\",\"fingerDetected\":%s,\"bpm\":%.1f,"
-               "\"avgBpm\":%d,\"spo2Approx\":%.1f}",
-               fingerDetected ? "true" : "false", beatsPerMinute, beatAvg,
-               spo2Approx);
-
-      webSocket.broadcastTXT(heartJson);
+  for (size_t i = 0; i < TOTAL_PADS; i++) {
+    if (input == PAD_CONFIGS[i].name) {
+      Serial.printf("🎮 [SIMULATOR] Triggered: %s\n", input.c_str());
+      sendPadPressEvent(PAD_CONFIGS[i].name);
+      return;
     }
   }
 }
-#endif
 
-// ==============================================================================
-// 10. SETUP & LOOP
-// ==============================================================================
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  // Give USB CDC time to attach
+  for (int i = 0; i < 20 && !Serial; i++) {
+    delay(100);
+  }
+  delay(500);
 
-  Serial.println("\n");
-  Serial.println("==================================================");
-  Serial.println("🚀 PlanKO ESP32 WebSocket Controller Initializing");
-  Serial.println("==================================================");
+  Serial.println(
+      "\n****************************************************************");
+  Serial.println("🌐 [PlanKO GATEWAY] Firmware Initializing...");
+  Serial.println(
+      "****************************************************************");
 
-  // กำหนดค่าและเตรียมขา GPIO สำหรับเซ็นเซอร์แผ่นแพลงก์
-  Serial.println("🛠 Initializing Plank Pad Sensors (INPUT_PULLUP)...");
+  // Initialize Pads
   for (size_t i = 0; i < TOTAL_PADS; i++) {
-    sensors[i].sensorId = PAD_CONFIGS[i].sensorId;
+    sensors[i].sensorId = PAD_CONFIGS[i].name;
     sensors[i].pin = PAD_CONFIGS[i].pin;
     sensors[i].lastRawState = HIGH;
     sensors[i].debouncedState = HIGH;
     sensors[i].lastDebounceTime = 0;
-
     if (sensors[i].pin >= 0) {
       pinMode(sensors[i].pin, INPUT_PULLUP);
-      int initialReading = digitalRead(sensors[i].pin);
-      sensors[i].lastRawState = initialReading;
-      sensors[i].debouncedState = initialReading;
-      Serial.printf("  ✓ Pad [%s] mapped to GPIO %d\n", sensors[i].sensorId,
-                    sensors[i].pin);
-    } else {
-      Serial.printf("  - Pad [%s] unassigned (Serial simulation only)\n",
-                    sensors[i].sensorId);
     }
   }
 
-  // เชื่อมต่อ Wi-Fi
-  connectWiFi();
+  // Connect to Wi-Fi
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
 
-  // เริ่มต้น WebSocket Server
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.println("\n📡 [WIFI] Associated with Wi-Fi AP!");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.printf("\n🎉 [WIFI] Connected! IP: %s\n",
+                    WiFi.localIP().toString().c_str());
+      Serial.printf("🔌 WebSocket Server: ws://%s:%u/\n",
+                    WiFi.localIP().toString().c_str(), WS_PORT);
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
+      Serial.printf("\n⚠️ [WIFI] Disconnected (Reason: %d). Reconnecting...\n",
+                    info.wifi_sta_disconnected.reason);
+      NimBLEScan *s = NimBLEDevice::getScan();
+      if (s && s->isScanning()) {
+        s->stop(); // Pause BLE scan so Wi-Fi can reconnect without radio
+                   // interference
+      }
+      WiFi.reconnect();
+      break;
+    }
+    default:
+      break;
+    }
+  });
+
+  Serial.printf("⏳ [WIFI] Connecting to SSID: '%s' with Static IP: %s...\n",
+                WIFI_SSID, STATIC_IP.toString().c_str());
+  WiFi.config(STATIC_IP, GATEWAY_IP, SUBNET_MASK, DNS_PRIMARY, DNS_SECONDARY);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+    if (attempts % 20 == 0) {
+      Serial.printf("\n⏳ Still connecting to '%s' (Attempt %d)...\n",
+                    WIFI_SSID, attempts);
+      WiFi.disconnect();
+      delay(200);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+  }
+  Serial.println();
+
+  Serial.printf("🎉 Wi-Fi Connected! IP: %s\n",
+                WiFi.localIP().toString().c_str());
+  Serial.printf("🔌 WebSocket URL: ws://%s:%u/\n",
+                WiFi.localIP().toString().c_str(), WS_PORT);
+
+  // Start WebSocket
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
-  Serial.printf("🚀 WebSocket Server Started on port %u\n", WS_PORT);
+  Serial.printf("🚀 WebSocket Server listening on port %u\n", WS_PORT);
+  Serial.printf("💾 [MEMORY] Free Heap: %u bytes\n", ESP.getFreeHeap());
 
-#if ENABLE_MAX30102
-  setupMAX30102();
-#endif
+  // Enable modem sleep AFTER Wi-Fi is ready (satisfies ESP-IDF coexistence
+  // requirement)
+  WiFi.setSleep(true);
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 
-  Serial.println("\n💡 TIP: คุณสามารถพิมพ์ 'L1' หรือ 'R5' ใน Serial Monitor "
-                 "เพื่อทดสอบส่ง Event ได้ทันที!");
-  Serial.println("พิมพ์ 'HELP' เพื่อดูคำสั่งทั้งหมด\n");
+  // Initialize BLE Central
+  NimBLEDevice::init("PlanKO_Gateway");
+  NimBLEScan *pScan = NimBLEDevice::getScan();
+  pScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
+  pScan->setActiveScan(true);
+  pScan->setDuplicateFilter(
+      false); // CRITICAL: Allow finding nodes again on retry/reconnect
+  // Balanced duty cycle (160ms interval, 40ms window = 25% duty cycle) leaves
+  // 75% radio time for Wi-Fi & WebSockets
+  pScan->setInterval(160);
+  pScan->setWindow(40);
+  pScan->start(0, false); // Continuous scanning in background
+  isScanning = true;
+  Serial.println(
+      "🔎 BLE Central Scanner started. Scanning for PlanKO_IMU_1..4...\n");
 }
 
 void loop() {
-  // จัดการการรับ-ส่งข้อมูลของ WebSocket Server
   webSocket.loop();
-
-  // สแกนสถานะปุ่มแผ่นรองแพลงก์พร้อม Debounce
-  checkPadSensors();
-
-  // ตรวจจับคำสั่งจำลองจาก Serial Monitor
+  handlePadInputs();
   handleSerialSimulator();
 
-#if ENABLE_MAX30102
-  processMAX30102();
-#endif
+  unsigned long now = millis();
 
-  // ตรวจสอบการเชื่อมต่อ Wi-Fi และเชื่อมต่อใหม่หากหลุด
-  static unsigned long lastWifiCheck = 0;
-  if (WiFi.status() != WL_CONNECTED && millis() - lastWifiCheck > 10000) {
-    lastWifiCheck = millis();
-    Serial.println("⚠️ [WIFI] Connection lost! Reconnecting...");
-    WiFi.reconnect();
+  // Check for pending BLE connections
+  for (int i = 0; i < MAX_NODES; i++) {
+    if (pendingConnectDevices[i] != nullptr) {
+      connectToNode(i);
+    }
+  }
+
+  // Detect stale BLE nodes (no data received for 3s) and force disconnect
+  // Re-read millis() because connectToNode() above is blocking and can take
+  // several seconds, making the earlier 'now' stale and causing underflow
+  unsigned long freshNow = millis();
+  for (int i = 0; i < MAX_NODES; i++) {
+    if (nodesTelemetry[i].connected && nodesTelemetry[i].lastReceivedMillis > 0) {
+      // Snapshot to avoid race with BLE notification callback (separate FreeRTOS task)
+      unsigned long lastRecv = nodesTelemetry[i].lastReceivedMillis;
+      unsigned long elapsed = freshNow - lastRecv;
+      // Guard: if elapsed wrapped (underflow from callback preemption), skip.
+      // Any real stale value will be < 60s; underflow produces ~4 billion.
+      if (elapsed > STALE_TIMEOUT_MS && elapsed < 60000UL) {
+        Serial.printf(
+            "⚠️ [GATEWAY-BLE] Node #%d stale (no data for %lums). Force "
+            "disconnecting...\n",
+            i + 1, elapsed);
+        if (pNodeClients[i] != nullptr && pNodeClients[i]->isConnected()) {
+          pNodeClients[i]->disconnect();
+        }
+        nodesTelemetry[i].connected = false;
+        nodesTelemetry[i].lastReceivedMillis = 0;
+        nodesTelemetry[i].lastSequence = 0;
+        resumeBleScanIfNeeded();
+      }
+    }
+  }
+
+  // Periodic WebSocket Broadcast of consolidated IMU streams (20Hz)
+  if (now - lastWsStreamTime >= WS_STREAM_INTERVAL_MS) {
+    lastWsStreamTime = now;
+    broadcastImuStream();
+  }
+
+  // 🌟 Periodic Gateway Heartbeat to Serial every 2 seconds
+  static unsigned long lastGatewayHeartbeat = 0;
+  if (now - lastGatewayHeartbeat >= 2000) {
+    lastGatewayHeartbeat = now;
+    int connectedCount = 0;
+    char nodesSummary[64] = "";
+    for (int i = 0; i < MAX_NODES; i++) {
+      if (nodesTelemetry[i].connected) {
+        connectedCount++;
+        char tmp[16];
+        snprintf(tmp, sizeof(tmp), "#%d ", i + 1);
+        strcat(nodesSummary, tmp);
+      }
+    }
+    if (connectedCount == 0)
+      strcpy(nodesSummary, "None");
+
+    Serial.printf("🌐 [GATEWAY] Wi-Fi: %s (%s) | WS: %u | BLE: %d/4 [%s] | "
+                  "Heap: %uB | Uptime: %lus\n",
+                  (WiFi.status() == WL_CONNECTED) ? "ONLINE" : "OFFLINE",
+                  (WiFi.status() == WL_CONNECTED)
+                      ? WiFi.localIP().toString().c_str()
+                      : "No IP",
+                  webSocket.connectedClients(), connectedCount, nodesSummary,
+                  ESP.getFreeHeap(), now / 1000);
   }
 }
+
+#else
+#error                                                                         \
+    "Please select an environment: 'gateway' or 'imu_node_1'..'imu_node_4' in platformio.ini"
+#endif
